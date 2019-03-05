@@ -13,18 +13,24 @@ from openapi_codec import OpenAPICodec
 from coreapi.codecs import JSONCodec
 from coreapi import Client
 
-irr_template = """irr {cost} {cost_term} {benefit} {benefit_term}
+irr_template = """{notes}
 
-rate: {rate}
-cost: {cost}
-cost_term: {cost_term}
-benefit: {benefit}
-benefit_term: {benefit_term}
-cost_pv: {cost_pv}
-benefit_pv: {benefit_pv}
-npv: {npv}
-irr: {irr}
-label: {label}
+irr {cost} {cost_term} {benefit} {benefit_term}
+
+issuebot report: #{report_num}
+
+| var | val |
+| --- | --- |
+| rate: | {rate:5.2f} |
+| cost: | {cost:5.2f} |
+| cost_term: | {cost_term} |
+| benefit: | {benefit:5.2f} |
+| benefit_term: | {benefit_term} |
+| cost_pv: | {cost_pv:5.2f} |
+| benefit_pv: | {benefit_pv:5.2f} |
+| npv: | {npv:5.2f} |
+| irr: | {value:5.2f} |
+| label: | {label} |
 
 irrend
 """
@@ -37,12 +43,14 @@ class Object(object):
 
 class IRR(object):
 
-    def __init__(self, rate, cost, cost_term, benefit, benefit_term):
+    def __init__(self, rate, cost, cost_term, benefit, benefit_term, report_num, notes):
         self.rate = rate
         self.cost = cost
         self.cost_term = cost_term
         self.benefit = benefit
         self.benefit_term = benefit_term
+        self.report_num = report_num
+        self.notes = notes
 
         self.cost_pv = cost / (1+rate)**(cost_term/365.0)
         self.benefit_pv = benefit / (1+rate)**(benefit_term/365.0)
@@ -55,15 +63,17 @@ class IRR(object):
         return body
 
     @classmethod
-    def match(cls, rate, txt):
+    def match(cls, rate, txt, report_num):
         irr = None
         # irr cost term benefit term
         m = re.match(
-                '^irr\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s*(|.*\nirrend)\s*$', 
-                txt, re.DOTALL)
+            '(.*?)\s*^irr\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s*(|.*\nirrend)\s*$', 
+                txt, re.DOTALL | re.MULTILINE)
         if m:
-            cost, cost_term, benefit, benefit_term = map(float, m.groups()[:4])
-            irr = cls(rate, cost, cost_term, benefit, benefit_term)
+            notes = m.group(1)
+            cost, cost_term, benefit, benefit_term = map(float, m.groups()[1:5])
+            irr = cls(rate, cost, cost_term, benefit, benefit_term,
+                    report_num, notes)
         return irr
 
 class ReportNode(object):
@@ -77,29 +87,33 @@ class Report(object):
 
     def __init__(self):
         self.db = {}
+        self.issue = None
 
     def __str__(self):
-        irrs = '### Issues sorted by IRR:\n\n'
-        missing = '### Issues missing IRR inputs:\n\n'
+        irrs = '### Issues sorted by IRR:\n\n| irr | issue | title |\n' \
+                '| --- | --- | --- |\n'
+        missing = '### Issues missing IRR inputs:\n\n| irr | issue | title |\n' \
+                '| --- | --- | --- |\n'
         for node in self.dump():
-            line = "- {:5.2f} #{}\n".format(node.irr.value, node.issue['id'])
+            line = "| {:5.2f} | #{} | {} |\n".format(
+                    node.irr.value, node.issue['number'], node.issue['title'])
             if node.irr.value != -1:
                 irrs += line
             else:
                 missing += line
-        out = irrs + '\n\n' + missing
+        out = "{}\n\n{}\n".format(irrs, missing)
         return out
 
     def add_issue(self, issue):
         node = ReportNode(issue)
-        self.db[issue['id']] = node
+        self.db[issue['number']] = node
 
     def set_irr(self, issue, irr):
-        self.db[issue['id']].irr = irr
+        self.db[issue['number']].irr = irr
 
     def sort_irr(self):
-        def get_irr_value(issue_id):
-            node =  self.db[issue_id]
+        def get_irr_value(issue_num):
+            node =  self.db[issue_num]
             return node.irr.value
         return sorted(self.db.keys(), key=get_irr_value, reverse=True)
 
@@ -116,7 +130,7 @@ class Gitea(object):
         decoders = [OpenAPICodec(), JSONCodec()]
         self.client = Client(decoders=decoders, auth=auth)
         self.schema = self.client.get(url, format='openapi')
-        # print(schema)
+        # print(self.schema)
 
     def action(self, tag, op, **kwargs):
         return self.client.action(self.schema, [tag, op], params=kwargs)
@@ -138,7 +152,6 @@ def main():
     gitea = Gitea(conf['url'], conf['token'])
 
     report = Report()
-    report_issue = None
 
     # get all open issues 
     page = 1
@@ -149,7 +162,7 @@ def main():
             break
         for issue in res:
             if issue['title'] == 'issuebot report':
-                report_issue = issue
+                report.issue = issue
                 continue
             report.add_issue(issue)
             '''
@@ -160,72 +173,32 @@ def main():
             '''
         page += 1
     
-    # scan comments for irr inputs
-    for issue in report.dump_issues():
-        res = gitea.action('issue', 'issueGetComments', 
-                owner=owner, repo=repo, index=issue['id'])
-        for comment in res:
-            irr = IRR.match(rate, comment['body'])
-            if irr:
-                report.set_irr(issue, irr)
-            
     # create report issue if needed
-    if not report_issue:
+    if not report.issue:
         # create empty issue
         print("creating empty issue titled 'issuebot report'")
-        report_issue = gitea.action('issue', 'issueCreateIssue', 
+        report.issue = gitea.action('issue', 'issueCreateIssue', 
                             owner=owner, repo=repo, title='issuebot report')
 
-    res = gitea.action('issue', 'issueEditIssue', 
-                owner=owner, repo=repo, index=report_issue['id'],
-                body='new body2')
-
-    # get report comment 
-    res = gitea.action('issue', 'issueGetComments', 
-                owner=owner, repo=repo, index=report_issue['id'])
-    if res:
-        report_comment = res[0]
-    else:
-        # create comment
-        res = gitea.action('issue', 'issueCreateComment', 
-                    owner=owner, repo=repo, index=report_issue['id'],
-                    body='placeholder')
-        report_comment = res
-
-    print('XXX')
-    print(report_issue)
-    print('YYY')
-    print(report_comment)
-    print('ZZZ')
-
-    sys.exit(1)
-
+    # scan comments for irr inputs
+    for issue in report.dump_issues():
+        # print(issue)
+        res = gitea.action('issue', 'issueGetComments', 
+                           owner=owner, repo=repo, index=issue['number'])
+        for comment in res:
+            irr = IRR.match(rate, comment['body'], report.issue['number'])
+            if irr:
+                report.set_irr(issue, irr)
+                res = gitea.action('issue', 'issueEditComment', 
+                    owner=owner, repo=repo, id=comment['id'], body=str(irr))
+                assert(res)
+            
+    # generate report
     body = str(report)
-    print(body)
-    params = dict(owner=owner, repo=repo, index=issue['id'], body=body)
-    res = client.action(schema, ['issue', 'issueEditIssue'], params=params)
-    print(res)
+    res = gitea.action('issue', 'issueEditIssue', 
+                owner=owner, repo=repo, index=report.issue['number'],
+                body=body)
 
-    sys.exit(1)
-
-
-
-    # XXX this stanza is from json2coreapi.py, needs to go away
-    txt = sys.stdin.read()
-    obj = json.loads(txt)
-    tag = obj['tag']
-    op = obj['op']
-    if 'params' in obj:
-        params = obj['params']
-    else:
-        params = None
-
-    # XXX this stays
-    res = client.action(schema, [tag, op], params=params)
-
-    # XXX this goes
-    print(json.dumps(res))
-    
 
 if __name__ == "__main__":
     main()
